@@ -8,7 +8,6 @@ app = FastAPI()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 VAPI_API_KEY = os.getenv("VAPI_API_KEY", "")
 VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
-PORT = int(os.getenv("PORT", "10000"))
 
 def wss_url(path):
     if not PUBLIC_BASE_URL:
@@ -28,13 +27,9 @@ async def root_get():
 async def root_head():
     return PlainTextResponse("")
 
-@app.get("/flow")
-async def flow_get():
-    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":160})
-
 @app.post("/flow")
 async def flow_post():
-    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":160})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream")})
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -66,34 +61,41 @@ def get_audio_b64(msg):
     d = msg.get("data")
     if isinstance(d, dict) and "audio_b64" in d:
         return d["audio_b64"]
-    return msg.get("audio_b64")
+    if "audio_b64" in msg:
+        return msg["audio_b64"]
+    if "payload" in msg:
+        return msg["payload"]
+    return None
 
 def parse_start(msg):
-    enc = None
+    enc = "audio/pcmu"
     rate = 8000
     ch = 1
     d = msg.get("data") if isinstance(msg.get("data"), dict) else {}
-    enc = (d.get("encoding") or msg.get("encoding") or "audio/l16").lower()
-    rate = int(d.get("sample_rate") or msg.get("sample_rate") or rate)
-    ch = int(d.get("channels") or msg.get("channels") or ch)
+    e = d.get("encoding") or msg.get("encoding")
+    sr = d.get("sample_rate") or msg.get("sample_rate")
+    c = d.get("channels") or msg.get("channels")
+    if isinstance(e, str): enc = e.lower()
+    try: rate = int(sr) if sr is not None else rate
+    except: rate = 8000
+    try: ch = int(c) if c is not None else ch
+    except: ch = 1
     return enc, rate, ch
 
 def l16_be_to_le(b):
-    if not b:
-        return b
+    if not b: return b
     return b[1::2] + b[0::2]
 
 def l16_le_to_be(b):
-    if not b:
-        return b
+    if not b: return b
     return b[1::2] + b[0::2]
 
 def to_vapi_bytes(raw_in, enc, rate_in):
     if not raw_in:
         return raw_in
     if "pcmu" in enc or "ulaw" in enc:
-        lin = audioop.ulaw2lin(raw_in, 2)
-        out, _ = audioop.ratecv(lin, 2, 1, 8000, 16000, None)
+        lin16 = audioop.ulaw2lin(raw_in, 2)
+        out, _ = audioop.ratecv(lin16, 2, 1, 8000, 16000, None)
         return out
     if "l16" in enc:
         le = l16_be_to_le(raw_in)
@@ -127,8 +129,7 @@ async def media_stream(ws: WebSocket):
     await ws.accept()
     vapi_ws = None
     reader_task = None
-    next_chunk_id = 1
-    enc = "audio/l16"
+    enc = "audio/pcmu"
     rate = 8000
     ch = 1
 
@@ -144,15 +145,13 @@ async def media_stream(ws: WebSocket):
             pass
 
     async def vapi_reader():
-        nonlocal next_chunk_id
         try:
             while True:
                 msg = await vapi_ws.recv()
                 if isinstance(msg, bytes):
                     out = from_vapi_bytes(msg, enc, rate)
                     b64 = base64.b64encode(out).decode()
-                    await ws.send_text(json.dumps({"type":"audio","audio_b64":b64,"chunk_id":next_chunk_id}))
-                    next_chunk_id += 1
+                    await ws.send_text(json.dumps({"type":"audio","data":{"audio_b64":b64}}))
                 else:
                     try:
                         j = json.loads(msg)
@@ -169,7 +168,9 @@ async def media_stream(ws: WebSocket):
                 msg = json.loads(txt)
             except:
                 continue
+
             t = msg.get("type") or msg.get("event")
+
             if t == "start":
                 enc, rate, ch = parse_start(msg)
                 url = await create_vapi_call()
@@ -182,6 +183,7 @@ async def media_stream(ws: WebSocket):
                 )
                 reader_task = asyncio.create_task(vapi_reader())
                 continue
+
             if t == "audio":
                 if not vapi_ws:
                     continue
@@ -199,8 +201,10 @@ async def media_stream(ws: WebSocket):
                     await close_all()
                     break
                 continue
-            if t in ["interrupt","clear"]:
+
+            if t in ["interrupt", "clear"]:
                 continue
+
     except WebSocketDisconnect:
         await close_all()
     except:
