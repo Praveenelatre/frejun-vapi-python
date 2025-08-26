@@ -147,7 +147,7 @@ async def media_stream(ws: WebSocket):
                 if isinstance(msg, bytes):
                     out = from_vapi_bytes(msg, enc, rate)
                     b64 = base64.b64encode(out).decode()
-                    await ws.send_text(json.dumps({"type":"audio","audio_b64":b64}))
+                    await ws.send_text(json.dumps({"type":"audio","data":{"audio_b64":b64}}))
                 else:
                     try:
                         j = json.loads(msg)
