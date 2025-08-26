@@ -1,24 +1,24 @@
-import os, json, base64, asyncio
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+import os, json, base64, asyncio, audioop
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-import httpx
-import websockets
-from dotenv import load_dotenv
+import httpx, websockets
 
-load_dotenv()
 app = FastAPI()
 
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+VAPI_API_KEY = os.getenv("VAPI_API_KEY", "")
+VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
+PORT = int(os.getenv("PORT", "10000"))
+
 def wss_url(path):
-    base = os.environ.get("PUBLIC_BASE_URL", "")
-    if not base:
+    if not PUBLIC_BASE_URL:
         return "wss://example.com" + path
-    if base.startswith("http://"):
-        base = "https://" + base[len("http://"):]
-    if base.startswith("https://"):
-        base = "wss://" + base[len("https://"):]
-    if base.endswith("/"):
-        base = base[:-1]
-    return base + path
+    u = PUBLIC_BASE_URL.rstrip("/")
+    if u.startswith("http://"):
+        u = "https://" + u[len("http://"):]
+    if u.startswith("https://"):
+        u = "wss://" + u[len("https://"):]
+    return u + path
 
 @app.get("/")
 async def root_get():
@@ -30,11 +30,11 @@ async def root_head():
 
 @app.get("/flow")
 async def flow_get():
-    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 400})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":320})
 
 @app.post("/flow")
 async def flow_post():
-    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 400})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":320})
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -45,31 +45,104 @@ async def webhook(req: Request):
     print("frejun_webhook", json.dumps(body))
     return JSONResponse({"ok": True})
 
+async def create_vapi_call():
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.vapi.ai/call",
+            headers={"Authorization":f"Bearer {VAPI_API_KEY}","Content-Type":"application/json"},
+            json={
+                "assistantId": VAPI_ASSISTANT_ID,
+                "transport": {
+                    "provider": "vapi.websocket",
+                    "audioFormat": {"format":"pcm_s16le","container":"raw","sampleRate":16000}
+                }
+            }
+        )
+        if r.status_code >= 300:
+            raise RuntimeError(r.text)
+        j = r.json()
+        return j.get("websocketCallUrl") or j.get("websocketUrl") or (j.get("transport") or {}).get("websocketCallUrl")
+
+def parse_start(msg):
+    enc = None
+    rate = 8000
+    ch = 1
+    d = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+    enc = d.get("encoding") or msg.get("encoding") or ""
+    rate = int(d.get("sample_rate") or msg.get("sample_rate") or rate)
+    ch = int(d.get("channels") or msg.get("channels") or ch)
+    return (enc.lower(), rate, ch)
+
+def frejun_audio_b64(msg):
+    if isinstance(msg.get("data"), dict) and "audio_b64" in msg["data"]:
+        return msg["data"]["audio_b64"]
+    if "audio_b64" in msg:
+        return msg["audio_b64"]
+    return None
+
+def l16_be_to_le(b):
+    if not b:
+        return b
+    return b[1::2] + b[0::2]
+
+def l16_le_to_be(b):
+    if not b:
+        return b
+    return b[1::2] + b[0::2]
+
+def to_vapi_bytes(b, enc, rate_in):
+    if not b:
+        return b
+    if enc.startswith("audio/pcmu") or "ulaw" in enc:
+        lin = audioop.ulaw2lin(b, 2)
+        out, _ = audioop.ratecv(lin, 2, 1, 8000, 16000, None)
+        return out
+    if enc.startswith("audio/l16"):
+        le = l16_be_to_le(b)
+        if rate_in != 16000:
+            out, _ = audioop.ratecv(le, 2, 1, rate_in, 16000, None)
+            return out
+        return le
+    le = l16_be_to_le(b)
+    out, _ = audioop.ratecv(le, 2, 1, rate_in, 16000, None)
+    return out
+
+def from_vapi_bytes(b, enc, rate_out):
+    if not b:
+        return b
+    if enc.startswith("audio/pcmu") or "ulaw" in enc:
+        down, _ = audioop.ratecv(b, 2, 1, 16000, 8000, None)
+        ul = audioop.lin2ulaw(down, 2)
+        return ul
+    if enc.startswith("audio/l16"):
+        if rate_out != 16000:
+            down, _ = audioop.ratecv(b, 2, 1, 16000, rate_out, None)
+        else:
+            down = b
+        be = l16_le_to_be(down)
+        return be
+    down, _ = audioop.ratecv(b, 2, 1, 16000, rate_out, None)
+    be = l16_le_to_be(down)
+    return be
+
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
     await ws.accept()
     vapi_ws = None
     reader_task = None
     next_chunk_id = 1
-    closed = False
+    enc = "audio/l16"
+    rate = 8000
+    ch = 1
 
     async def close_all():
-        nonlocal closed
-        if closed:
-            return
-        closed = True
-        try:
-            await ws.close()
-        except:
-            pass
         try:
             if vapi_ws:
                 await vapi_ws.close()
         except:
             pass
         try:
-            if reader_task:
-                reader_task.cancel()
+            await ws.close()
         except:
             pass
 
@@ -79,10 +152,10 @@ async def media_stream(ws: WebSocket):
             while True:
                 msg = await vapi_ws.recv()
                 if isinstance(msg, bytes):
-                    b64 = base64.b64encode(msg).decode()
-                    out = {"type": "audio", "audio_b64": b64, "chunk_id": next_chunk_id}
+                    out = from_vapi_bytes(msg, enc, rate)
+                    b64 = base64.b64encode(out).decode()
+                    await ws.send_text(json.dumps({"type":"audio","audio_b64":b64,"chunk_id":next_chunk_id}))
                     next_chunk_id += 1
-                    await ws.send_text(json.dumps(out))
                 else:
                     try:
                         j = json.loads(msg)
@@ -94,73 +167,36 @@ async def media_stream(ws: WebSocket):
 
     try:
         while True:
-            data = await ws.receive_text()
+            txt = await ws.receive_text()
             try:
-                msg = json.loads(data)
+                msg = json.loads(txt)
             except:
                 continue
-
-            t = msg.get("type")
+            t = msg.get("type") or msg.get("event")
             if t == "start":
-                api_key = os.environ.get("VAPI_API_KEY", "")
-                assistant_id = os.environ.get("VAPI_ASSISTANT_ID", "")
-                if not api_key or not assistant_id:
-                    await close_all()
-                    break
-                async with httpx.AsyncClient(timeout=30) as client:
-                    r = await client.post(
-                        "https://api.vapi.ai/call",
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                        json={
-                            "assistantId": assistant_id,
-                            "transport": {
-                                "provider": "vapi.websocket",
-                                "audioFormat": {"format": "pcm_s16le", "container": "raw", "sampleRate": 16000}
-                            }
-                        }
-                    )
-                if r.status_code >= 300:
-                    print("vapi_create_error", r.text)
-                    await close_all()
-                    break
-                j = r.json()
-                ws_url = j.get("websocketCallUrl") or j.get("websocketUrl") or (j.get("transport") or {}).get("websocketCallUrl")
-                if not ws_url:
-                    print("vapi_no_ws_url", json.dumps(j))
-                    await close_all()
-                    break
-                vapi_ws = await websockets.connect(
-                    ws_url,
-                    extra_headers={"Authorization": f"Bearer {api_key}"},
-                    compression=None,
-                    ping_interval=20,
-                    ping_timeout=20
-                )
+                enc, rate, ch = parse_start(msg)
+                url = await create_vapi_call()
+                vapi_ws = await websockets.connect(url, extra_headers={"Authorization": f"Bearer {VAPI_API_KEY}"}, compression=None, ping_interval=20, ping_timeout=20)
                 reader_task = asyncio.create_task(vapi_reader())
                 continue
-
             if t == "audio":
-                if vapi_ws is None:
+                if not vapi_ws:
                     continue
-                b64 = None
-                if isinstance(msg.get("data"), dict) and "audio_b64" in msg["data"]:
-                    b64 = msg["data"]["audio_b64"]
-                elif "audio_b64" in msg:
-                    b64 = msg["audio_b64"]
-                if not b64:
+                a64 = frejun_audio_b64(msg)
+                if not a64:
                     continue
                 try:
-                    buf = base64.b64decode(b64, validate=True)
+                    raw = base64.b64decode(a64, validate=True)
                 except:
                     continue
+                pcm16 = to_vapi_bytes(raw, enc, rate)
                 try:
-                    await vapi_ws.send(buf)
+                    vapi_ws.send(pcm16)
                 except:
                     await close_all()
                     break
                 continue
-
-            if t in ["interrupt", "clear"]:
+            if t in ["interrupt","clear"]:
                 continue
     except WebSocketDisconnect:
         await close_all()
