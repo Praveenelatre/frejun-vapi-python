@@ -25,7 +25,7 @@ async def root_get():
 
 @app.post("/flow")
 async def flow_post():
-    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":60})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":200})
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -148,8 +148,7 @@ async def media_stream(ws: WebSocket):
                 if isinstance(msg, bytes):
                     out = from_vapi_bytes(msg, enc, rate)
                     b64 = base64.b64encode(out).decode()
-                    cid = next(chunk_ids)
-                    await ws.send_text(json.dumps({"type":"audio","audio_b64":b64,"chunk_id":cid}))
+                    await ws.send_text(json.dumps({"type":"media","media":"audio","payload":b64}))
                 else:
                     try:
                         j = json.loads(msg)
@@ -173,7 +172,7 @@ async def media_stream(ws: WebSocket):
             except:
                 continue
             t = msg.get("type") or msg.get("event")
-            if t == "start" and not started:
+            if not started and t in ["start","stream.start"]:
                 enc, rate, ch = parse_start(msg)
                 url = await create_vapi_call()
                 vapi_ws = await websockets.connect(
@@ -186,7 +185,7 @@ async def media_stream(ws: WebSocket):
                 asyncio.create_task(vapi_reader())
                 started = True
                 continue
-            if t == "audio":
+            if t in ["audio","media"]:
                 if not vapi_ws:
                     continue
                 a64 = get_audio_b64(msg)
