@@ -1,4 +1,4 @@
-import os, json, base64, asyncio
+import os, json, base64, asyncio, audioop
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx, websockets
@@ -30,11 +30,11 @@ async def root_head():
 
 @app.get("/flow")
 async def flow_get():
-    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":320})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":160})
 
 @app.post("/flow")
 async def flow_post():
-    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":320})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":160})
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -62,11 +62,65 @@ async def create_vapi_call():
         j = r.json()
         return j.get("websocketCallUrl") or j.get("websocketUrl") or (j.get("transport") or {}).get("websocketCallUrl")
 
-def get_audio_b64(msg: dict):
+def get_audio_b64(msg):
     d = msg.get("data")
     if isinstance(d, dict) and "audio_b64" in d:
         return d["audio_b64"]
     return msg.get("audio_b64")
+
+def parse_start(msg):
+    enc = None
+    rate = 8000
+    ch = 1
+    d = msg.get("data") if isinstance(msg.get("data"), dict) else {}
+    enc = (d.get("encoding") or msg.get("encoding") or "audio/l16").lower()
+    rate = int(d.get("sample_rate") or msg.get("sample_rate") or rate)
+    ch = int(d.get("channels") or msg.get("channels") or ch)
+    return enc, rate, ch
+
+def l16_be_to_le(b):
+    if not b:
+        return b
+    return b[1::2] + b[0::2]
+
+def l16_le_to_be(b):
+    if not b:
+        return b
+    return b[1::2] + b[0::2]
+
+def to_vapi_bytes(raw_in, enc, rate_in):
+    if not raw_in:
+        return raw_in
+    if "pcmu" in enc or "ulaw" in enc:
+        lin = audioop.ulaw2lin(raw_in, 2)
+        out, _ = audioop.ratecv(lin, 2, 1, 8000, 16000, None)
+        return out
+    if "l16" in enc:
+        le = l16_be_to_le(raw_in)
+        if rate_in != 16000:
+            out, _ = audioop.ratecv(le, 2, 1, rate_in, 16000, None)
+            return out
+        return le
+    out, _ = audioop.ratecv(raw_in, 2, 1, rate_in, 16000, None)
+    return out
+
+def from_vapi_bytes(raw16le_16k, enc, rate_out):
+    if not raw16le_16k:
+        return raw16le_16k
+    if "pcmu" in enc or "ulaw" in enc:
+        down, _ = audioop.ratecv(raw16le_16k, 2, 1, 16000, 8000, None)
+        ul = audioop.lin2ulaw(down, 2)
+        return ul
+    if "l16" in enc:
+        if rate_out != 16000:
+            down, _ = audioop.ratecv(raw16le_16k, 2, 1, 16000, rate_out, None)
+        else:
+            down = raw16le_16k
+        be = l16_le_to_be(down)
+        return be
+    down, _ = audioop.ratecv(raw16le_16k, 2, 1, 16000, rate_out, None)
+    be = l16_le_to_be(down)
+    return be
 
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
@@ -74,6 +128,9 @@ async def media_stream(ws: WebSocket):
     vapi_ws = None
     reader_task = None
     next_chunk_id = 1
+    enc = "audio/l16"
+    rate = 8000
+    ch = 1
 
     async def close_all():
         try:
@@ -92,10 +149,10 @@ async def media_stream(ws: WebSocket):
             while True:
                 msg = await vapi_ws.recv()
                 if isinstance(msg, bytes):
-                    b64 = base64.b64encode(msg).decode()
-                    out = {"type":"audio","audio_b64": b64, "chunk_id": next_chunk_id}
+                    out = from_vapi_bytes(msg, enc, rate)
+                    b64 = base64.b64encode(out).decode()
+                    await ws.send_text(json.dumps({"type":"audio","audio_b64":b64,"chunk_id":next_chunk_id}))
                     next_chunk_id += 1
-                    await ws.send_text(json.dumps(out))
                 else:
                     try:
                         j = json.loads(msg)
@@ -112,10 +169,9 @@ async def media_stream(ws: WebSocket):
                 msg = json.loads(txt)
             except:
                 continue
-
             t = msg.get("type") or msg.get("event")
-
             if t == "start":
+                enc, rate, ch = parse_start(msg)
                 url = await create_vapi_call()
                 vapi_ws = await websockets.connect(
                     url,
@@ -126,7 +182,6 @@ async def media_stream(ws: WebSocket):
                 )
                 reader_task = asyncio.create_task(vapi_reader())
                 continue
-
             if t == "audio":
                 if not vapi_ws:
                     continue
@@ -137,16 +192,15 @@ async def media_stream(ws: WebSocket):
                     raw = base64.b64decode(a64, validate=True)
                 except:
                     continue
+                pcm16 = to_vapi_bytes(raw, enc, rate)
                 try:
-                    await vapi_ws.send(raw)
+                    await vapi_ws.send(pcm16)
                 except:
                     await close_all()
                     break
                 continue
-
-            if t in ["interrupt", "clear"]:
+            if t in ["interrupt","clear"]:
                 continue
-
     except WebSocketDisconnect:
         await close_all()
     except:
