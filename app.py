@@ -1,5 +1,4 @@
 import os, json, base64, asyncio
-from array import array
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
@@ -21,14 +20,6 @@ def wss_url(path):
         base = base[:-1]
     return base + path
 
-def swap16(b: bytes) -> bytes:
-    if not b:
-        return b
-    a = array("h")
-    a.frombytes(b)
-    a.byteswap()
-    return a.tobytes()
-
 @app.get("/")
 async def root_get():
     return PlainTextResponse("ok")
@@ -39,11 +30,11 @@ async def root_head():
 
 @app.get("/flow")
 async def flow_get():
-    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 320})
+    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 400})
 
 @app.post("/flow")
 async def flow_post():
-    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 320})
+    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 400})
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -88,8 +79,7 @@ async def media_stream(ws: WebSocket):
             while True:
                 msg = await vapi_ws.recv()
                 if isinstance(msg, bytes):
-                    be = swap16(msg)
-                    b64 = base64.b64encode(be).decode()
+                    b64 = base64.b64encode(msg).decode()
                     out = {"type": "audio", "audio_b64": b64, "chunk_id": next_chunk_id}
                     next_chunk_id += 1
                     await ws.send_text(json.dumps(out))
@@ -110,7 +100,8 @@ async def media_stream(ws: WebSocket):
             except:
                 continue
 
-            if msg.get("type") == "start":
+            t = msg.get("type")
+            if t == "start":
                 api_key = os.environ.get("VAPI_API_KEY", "")
                 assistant_id = os.environ.get("VAPI_ASSISTANT_ID", "")
                 if not api_key or not assistant_id:
@@ -124,7 +115,7 @@ async def media_stream(ws: WebSocket):
                             "assistantId": assistant_id,
                             "transport": {
                                 "provider": "vapi.websocket",
-                                "audioFormat": {"format": "pcm_s16le", "container": "raw", "sampleRate": 8000}
+                                "audioFormat": {"format": "pcm_s16le", "container": "raw", "sampleRate": 16000}
                             }
                         }
                     )
@@ -148,22 +139,28 @@ async def media_stream(ws: WebSocket):
                 reader_task = asyncio.create_task(vapi_reader())
                 continue
 
-            if msg.get("type") == "audio":
+            if t == "audio":
                 if vapi_ws is None:
                     continue
+                b64 = None
+                if isinstance(msg.get("data"), dict) and "audio_b64" in msg["data"]:
+                    b64 = msg["data"]["audio_b64"]
+                elif "audio_b64" in msg:
+                    b64 = msg["audio_b64"]
+                if not b64:
+                    continue
                 try:
-                    be = base64.b64decode(msg.get("audio_b64", ""), validate=True)
+                    buf = base64.b64decode(b64, validate=True)
                 except:
                     continue
-                le = swap16(be)
                 try:
-                    await vapi_ws.send(le)
+                    await vapi_ws.send(buf)
                 except:
                     await close_all()
                     break
                 continue
 
-            if msg.get("type") in ["interrupt", "clear"]:
+            if t in ["interrupt", "clear"]:
                 continue
     except WebSocketDisconnect:
         await close_all()
