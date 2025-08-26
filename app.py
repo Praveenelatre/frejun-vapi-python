@@ -1,6 +1,6 @@
-import os, json, base64, asyncio
+import os, json, base64, asyncio, array
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 import websockets
 from dotenv import load_dotenv
@@ -21,8 +21,31 @@ def wss_url(path):
         base = base[:-1]
     return base + path
 
+def be16_to_le16(b: bytes) -> bytes:
+    if not b:
+        return b
+    a = array.array("h")
+    a.frombytes(b[1::2] + b[0::2])
+    return a.tobytes()
+
+def le16_to_be16(b: bytes) -> bytes:
+    if not b:
+        return b
+    a = array.array("h")
+    a.frombytes(b)
+    bb = a.tobytes()
+    return bb[1::2] + bb[0::2]
+
+@app.get("/")
+async def root():
+    return PlainTextResponse("ok")
+
+@app.get("/flow")
+async def flow_get():
+    return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 400})
+
 @app.post("/flow")
-async def flow():
+async def flow_post():
     return JSONResponse({"action": "Stream", "ws_url": wss_url("/media-stream"), "chunk_size": 400})
 
 @app.post("/webhook")
@@ -68,7 +91,8 @@ async def media_stream(ws: WebSocket):
             while True:
                 msg = await vapi_ws.recv()
                 if isinstance(msg, bytes):
-                    b64 = base64.b64encode(msg).decode()
+                    be = le16_to_be16(msg)
+                    b64 = base64.b64encode(be).decode()
                     out = {"type": "audio", "audio_b64": b64, "chunk_id": next_chunk_id}
                     next_chunk_id += 1
                     await ws.send_text(json.dumps(out))
@@ -103,7 +127,7 @@ async def media_stream(ws: WebSocket):
                             "assistantId": assistant_id,
                             "transport": {
                                 "provider": "vapi.websocket",
-                                "audioFormat": {"format": "pcm_s16le", "container": "raw", "sampleRate": 16000}
+                                "audioFormat": {"format": "pcm_s16le", "container": "raw", "sampleRate": 8000}
                             }
                         }
                     )
@@ -125,11 +149,12 @@ async def media_stream(ws: WebSocket):
                 if vapi_ws is None:
                     continue
                 try:
-                    buf = base64.b64decode(msg.get("audio_b64", ""), validate=True)
+                    be = base64.b64decode(msg.get("audio_b64", ""), validate=True)
                 except:
                     continue
+                le = be16_to_le16(be)
                 try:
-                    await vapi_ws.send(buf)
+                    await vapi_ws.send(le)
                 except:
                     await close_all()
                     break
