@@ -1,4 +1,4 @@
-import os, json, base64, asyncio, audioop
+import os, json, base64, asyncio, audioop, itertools
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx, websockets
@@ -25,7 +25,7 @@ async def root_get():
 
 @app.post("/flow")
 async def flow_post():
-    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream")})
+    return JSONResponse({"action":"Stream","ws_url":wss_url("/media-stream"),"chunk_size":60})
 
 @app.post("/webhook")
 async def webhook(req: Request):
@@ -48,7 +48,7 @@ async def create_vapi_call():
         )
         r.raise_for_status()
         j = r.json()
-        return j.get("websocketCallUrl") or j.get("websocketUrl") or (j.get("transport") or {}).get("websocketCallUrl")
+        return j.get("websocketCallUrl") or (j.get("transport") or {}).get("websocketCallUrl") or j.get("websocketUrl")
 
 def get_audio_b64(msg):
     d = msg.get("data")
@@ -61,7 +61,7 @@ def get_audio_b64(msg):
     return None
 
 def parse_start(msg):
-    enc = "audio/pcmu"
+    enc = "audio/l16"
     rate = 8000
     ch = 1
     d = msg.get("data") if isinstance(msg.get("data"), dict) else {}
@@ -125,9 +125,10 @@ def from_vapi_bytes(raw16le_16k, enc, rate_out):
 async def media_stream(ws: WebSocket):
     await ws.accept()
     vapi_ws = None
-    enc = "audio/pcmu"
+    enc = "audio/l16"
     rate = 8000
     ch = 1
+    chunk_ids = itertools.count(1)
 
     async def close_all():
         try:
@@ -147,7 +148,8 @@ async def media_stream(ws: WebSocket):
                 if isinstance(msg, bytes):
                     out = from_vapi_bytes(msg, enc, rate)
                     b64 = base64.b64encode(out).decode()
-                    await ws.send_text(json.dumps({"type":"audio","data":{"audio_b64":b64}}))
+                    cid = next(chunk_ids)
+                    await ws.send_text(json.dumps({"type":"audio","audio_b64":b64,"chunk_id":cid}))
                 else:
                     try:
                         j = json.loads(msg)
@@ -158,14 +160,20 @@ async def media_stream(ws: WebSocket):
             await close_all()
 
     try:
+        started = False
         while True:
-            txt = await ws.receive_text()
+            r = await ws.receive()
+            if r["type"] == "websocket.disconnect":
+                break
+            data = r.get("text")
+            if not data and r.get("bytes") is not None:
+                continue
             try:
-                msg = json.loads(txt)
+                msg = json.loads(data)
             except:
                 continue
             t = msg.get("type") or msg.get("event")
-            if t in ["start","stream.start"]:
+            if t == "start" and not started:
                 enc, rate, ch = parse_start(msg)
                 url = await create_vapi_call()
                 vapi_ws = await websockets.connect(
@@ -176,8 +184,9 @@ async def media_stream(ws: WebSocket):
                     ping_timeout=20
                 )
                 asyncio.create_task(vapi_reader())
+                started = True
                 continue
-            if t in ["audio","media"]:
+            if t == "audio":
                 if not vapi_ws:
                     continue
                 a64 = get_audio_b64(msg)
