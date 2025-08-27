@@ -14,16 +14,16 @@ from teler.streams import StreamConnector, StreamOp, StreamType
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Global variables (replaced with your actual values)
-VAPI_API_KEY = "00b4c9e2-6fbe-490f-b9a1-b030b7f96aed"
-VAPI_ASSISTANT_ID = "575212be-3f43-4cb9-9ad9-e38d299bf828"
-VAPI_SAMPLE_RATE = int(os.getenv("VAPI_SAMPLE_RATE", "8000"))
+# Global variables
+VAPI_API_KEY = os.getenv("VAPI_API_KEY", "")
+VAPI_ASSISTANT_ID = os.getenv("VAPI_ASSISTANT_ID", "")
+VAPI_SAMPLE_RATE = os.getenv("VAPI_SAMPLE_RATE", 8000)
 
-SERVER_DOMAIN = "frejun-vapi-python.onrender.com"
+SERVER_DOMAIN = os.getenv("SERVER_DOMAIN", "")
 
-TELER_API_KEY = "46b969804b36947b998152fe781335e5cca9921c76c447b6f8c63e4a7a319eac"
-FROM_NUMBER = "+91123*******"   # replace with your real Teler provisioned number if using outbound
-TO_NUMBER = "+91456*******"     # replace with test destination if using outbound
+TELER_API_KEY = os.getenv("TELER_API_KEY", "")
+FROM_NUMBER = "+91123*******"
+TO_NUMBER = "+91456*******"
 
 class CallFlowRequest(BaseModel):
     call_id: str
