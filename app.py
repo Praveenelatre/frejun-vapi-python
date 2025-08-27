@@ -5,7 +5,7 @@ import os
 from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Body, HTTPException, WebSocket, status
+from fastapi import APIRouter, Body, HTTPException, WebSocket, status, FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from teler import AsyncClient, CallFlow
@@ -131,3 +131,7 @@ async def create_vapi_call():
         r.raise_for_status()
         j = r.json()
         return j.get("transport").get("websocketCallUrl")
+
+# -------- add FastAPI app so uvicorn can find app:app --------
+app = FastAPI()
+app.include_router(router)
